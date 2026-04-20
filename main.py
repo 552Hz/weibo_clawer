@@ -1,15 +1,14 @@
 """
-微博监控插件
-功能：
-1. 监控指定微博用户的新动态
-2. 定时爬取并推送到指定群聊
-3. 支持图片预览
+微博监控插件 v2
+使用高级反爬策略，多API自动切换
 """
 
 import asyncio
 import json
 import re
 import os
+import random
+import hashlib
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -24,70 +23,81 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.message_components import Image as ImageSeg
 
 
+# 随机User-Agent池
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+]
+
+
 class WeiboMonitor(Star):
-    """微博监控插件"""
+    """微博监控插件 v2"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.name = "微博监控"
+        self.session: Optional[aiohttp.ClientSession] = None
 
-        # 数据存储路径
         from astrbot.core.utils.astrbot_path import get_astrbot_data_path
         data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_weibo"
         data_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir = data_dir
 
-        # 存储上次爬取的状态
         self.state_file = data_dir / "state.json"
-        self.last_post_ids: dict[str, str] = {}  # {uid: last_post_id}
+        self.last_post_ids: dict[str, str] = {}
         self._load_state()
 
-        # 爬取锁，防止并发
         self._fetch_lock = False
-
-        # 启动定时任务
         self._task: Optional[asyncio.Task] = None
-        logger.info("微博监控插件已加载")
+        self._last_request_time = 0
+        logger.info("微博监控插件v2已加载")
 
     def _load_state(self):
-        """加载上次状态"""
         if self.state_file.exists():
             try:
                 with open(self.state_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     self.last_post_ids = data.get("last_post_ids", {})
-                logger.info(f"已加载 {len(self.last_post_ids)} 个用户的监控状态")
             except Exception as e:
                 logger.error(f"加载状态失败: {e}")
 
     def _save_state(self):
-        """保存状态"""
         try:
             with open(self.state_file, 'w', encoding='utf-8') as f:
                 json.dump({"last_post_ids": self.last_post_ids}, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建HTTP会话"""
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=30, connect=15)
+            connector = aiohttp.TCPConnector(ssl=False, limit=10)
+            self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return self.session
+
     async def on_astrbot_loaded(self):
-        """AstrBot加载完成后启动定时任务"""
         interval = self.config.get("check_interval", 10)
         self._task = asyncio.create_task(self._monitor_loop(interval * 60))
         logger.info(f"微博监控已启动，检查间隔: {interval} 分钟")
 
     async def terminate(self):
-        """插件卸载时停止任务"""
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self.session and not self.session.closed:
+            await self.session.close()
         self._save_state()
         logger.info("微博监控插件已卸载")
 
     async def _monitor_loop(self, interval_seconds: int):
-        """定时监控循环"""
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
@@ -96,10 +106,17 @@ class WeiboMonitor(Star):
                 break
             except Exception as e:
                 logger.error(f"监控循环出错: {e}")
-                await asyncio.sleep(60)  # 出错后等待1分钟再试
+                await asyncio.sleep(60)
+
+    async def _rate_limit(self):
+        """请求限速，避免被封"""
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < 2:
+            await asyncio.sleep(2 - elapsed)
+        self._last_request_time = time.time()
 
     async def _check_new_posts(self):
-        """检查所有监控用户的新动态"""
         if self._fetch_lock:
             logger.debug("上次爬取尚未完成，跳过本次")
             return
@@ -129,11 +146,12 @@ class WeiboMonitor(Star):
                     continue
 
                 try:
+                    await self._rate_limit()
                     new_posts = await self._fetch_user_posts(uid, cookies, skip_top)
                     if new_posts:
                         for post in new_posts:
                             await self._send_to_groups(post, target_groups)
-                            await asyncio.sleep(2)  # 避免发送太快
+                            await asyncio.sleep(3)
                 except Exception as e:
                     logger.error(f"获取用户 {uid} 动态失败: {e}")
 
@@ -141,120 +159,319 @@ class WeiboMonitor(Star):
             self._fetch_lock = False
 
     async def _fetch_user_posts(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
-        """获取用户最新微博动态"""
-        headers = {
-            "Cookie": cookies,
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "MWeibo-Pwa": "1",
-            "Referer": "https://m.weibo.cn/",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-        }
+        """获取用户最新微博动态，尝试多个API"""
 
-        async with aiohttp.ClientSession() as session:
-            # 使用微博API获取用户最新微博
+        # 策略1: 尝试移动版API
+        posts = await self._try_mobile_api(uid, cookies, skip_top)
+        if posts:
+            return posts
+
+        # 策略2: 尝试网页版API
+        posts = await self._try_web_api(uid, cookies, skip_top)
+        if posts:
+            return posts
+
+        # 策略3: 尝试搜索API
+        posts = await self._try_search_api(uid, cookies, skip_top)
+        if posts:
+            return posts
+
+        logger.warning(f"所有API策略均失败，用户: {uid}")
+        return []
+
+    async def _try_mobile_api(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
+        """策略1: 移动版API"""
+        try:
+            session = await self._get_session()
+            headers = self._build_headers(cookies, "https://m.weibo.cn/")
+
             url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page=1"
 
-            async with session.get(url, headers=headers, timeout=30, allow_redirects=True) as resp:
-                content_type = resp.headers.get('Content-Type', '')
-
-                # 检查是否是登录页面
-                if 'text/html' in content_type or resp.status == 200:
-                    text = await resp.text()
-                    if '登录' in text or 'login' in text.lower() or '<!DOCTYPE html>' in text[:50]:
-                        logger.warning("Cookie无效，微博返回登录页面")
-                        return []
-
+            async with session.get(url, headers=headers) as resp:
                 if resp.status != 200:
-                    logger.error(f"请求失败，状态码: {resp.status}")
+                    return []
+
+                text = await resp.text()
+                if self._is_login_page(text):
+                    logger.warning("移动API: Cookie无效")
                     return []
 
                 try:
-                    data = await resp.json()
-                except Exception:
-                    text = await resp.text()
-                    logger.error(f"JSON解析失败，响应: {text[:200]}")
+                    data = json.loads(text)
+                except:
                     return []
 
                 if data.get("ok") != 1:
-                    logger.warning(f"获取用户 {uid} 动态失败: {data}")
                     return []
 
-                cards = data.get("data", {}).get("cards", [])
-                new_posts = []
+                return self._parse_cards(data.get("data", {}).get("cards", []), uid, skip_top)
+        except Exception as e:
+            logger.debug(f"移动API失败: {e}")
+            return []
 
-                for card in cards:
-                    if card.get("card_type") != 9:  # 9 = 微博动态卡片
-                        continue
+    async def _try_web_api(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
+        """策略2: 网页版Ajax API"""
+        try:
+            session = await self._get_session()
+            headers = self._build_headers(cookies, f"https://weibo.com/u/{uid}")
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            headers["X-Requested-With"] = "fetch"
 
-                    mblog = card.get("mblog", {})
-                    post_id = mblog.get("id", "")
+            url = f"https://weibo.com/ajax/statuses/mymblog?uid={uid}&page=1&feature=0"
 
-                    # 跳过置顶微博
-                    if skip_top and mblog.get("isTop"):
-                        continue
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return []
 
-                    # 检查是否已推送过
-                    if uid in self.last_post_ids and self.last_post_ids[uid] == post_id:
-                        break  # 之后的都是更旧的
+                text = await resp.text()
+                if self._is_login_page(text):
+                    logger.warning("网页API: Cookie无效")
+                    return []
 
-                    # 解析微博内容
-                    post_data = self._parse_weibo_post(mblog)
-                    if post_data:
-                        new_posts.append(post_data)
+                try:
+                    data = json.loads(text)
+                except:
+                    return []
 
-                # 更新状态
-                if cards:
-                    first_mblog = None
-                    for card in cards:
-                        if card.get("card_type") == 9:
-                            first_mblog = card.get("mblog", {})
-                            break
+                if data.get("ok") != 1:
+                    return []
 
-                    if first_mblog:
-                        self.last_post_ids[uid] = first_mblog.get("id", "")
-                        self._save_state()
+                posts = data.get("data", {}).get("list", [])
+                return self._parse_posts_list(posts, uid, skip_top)
+        except Exception as e:
+            logger.debug(f"网页API失败: {e}")
+            return []
 
-                return new_posts
+    async def _try_search_api(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
+        """策略3: 搜索API，通过uid获取用户名后再搜索"""
+        try:
+            # 先获取用户名
+            username = await self._get_username(uid, cookies)
+            if not username:
+                return []
+
+            session = await self._get_session()
+            headers = self._build_headers(cookies, "https://s.weibo.com")
+
+            # 使用搜索API
+            search_url = f"https://s.weibo.com/weibo?q=from%3A{username}&Refer=SWeibo_box"
+            encoded_url = f"https://s.weibo.com/weibo?q=from%3A{username}&typeall=1&suball=1&timescope=custom:recent&Refer=index"
+
+            async with session.get(encoded_url, headers=headers) as resp:
+                text = await resp.text()
+                if self._is_login_page(text):
+                    logger.warning("搜索API: Cookie无效")
+                    return []
+
+                # 解析搜索结果页面
+                return self._parse_search_page(text, uid, skip_top)
+        except Exception as e:
+            logger.debug(f"搜索API失败: {e}")
+            return []
+
+    async def _get_username(self, uid: str, cookies: str) -> Optional[str]:
+        """获取微博用户名"""
+        try:
+            session = await self._get_session()
+            headers = self._build_headers(cookies, f"https://weibo.com/u/{uid}")
+            headers["Accept"] = "application/json"
+
+            url = f"https://weibo.com/ajax/profile/info?uid={uid}"
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = json.loads(await resp.text())
+                    if data.get("ok") == 1:
+                        return data.get("data", {}).get("user", {}).get("screen_name")
+        except:
+            pass
+        return None
+
+    def _build_headers(self, cookies: str, referer: str) -> dict:
+        """构建完整的请求头"""
+        return {
+            "Cookie": cookies,
+            "User-Agent": random.choice(USER_AGENTS),
+            "Referer": referer,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Cache-Control": "max-age=0",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    def _is_login_page(self, text: str) -> bool:
+        """检测是否是登录页面"""
+        text_lower = text.lower()
+        login_indicators = ['登录', 'login', 'passport.weibo', 'sso.weibo', '请先登录']
+        return any(indicator.lower() in text_lower for indicator in login_indicators)
+
+    def _parse_cards(self, cards: list, uid: str, skip_top: bool) -> list[dict]:
+        """解析移动API的cards"""
+        new_posts = []
+        seen_ids = set()
+
+        for card in cards:
+            if card.get("card_type") != 9:
+                continue
+
+            mblog = card.get("mblog", {})
+            post_id = mblog.get("id", "")
+
+            if post_id in seen_ids:
+                continue
+            seen_ids.add(post_id)
+
+            if skip_top and mblog.get("isTop"):
+                continue
+
+            if uid in self.last_post_ids and self.last_post_ids[uid] == post_id:
+                break
+
+            post_data = self._parse_weibo_post(mblog)
+            if post_data:
+                new_posts.append(post_data)
+
+        if cards:
+            for card in cards:
+                if card.get("card_type") == 9:
+                    self.last_post_ids[uid] = card.get("mblog", {}).get("id", "")
+                    self._save_state()
+                    break
+
+        return new_posts
+
+    def _parse_posts_list(self, posts: list, uid: str, skip_top: bool) -> list[dict]:
+        """解析网页API的posts list"""
+        new_posts = []
+
+        for post in posts:
+            post_id = post.get("id", "")
+
+            if skip_top and post.get("isTop"):
+                continue
+
+            if uid in self.last_post_ids and self.last_post_ids[uid] == post_id:
+                break
+
+            post_data = self._parse_weibo_post_web(post)
+            if post_data:
+                new_posts.append(post_data)
+
+        if posts:
+            self.last_post_ids[uid] = posts[0].get("id", "")
+            self._save_state()
+
+        return new_posts
+
+    def _parse_search_page(self, html: str, uid: str, skip_top: bool) -> list[dict]:
+        """解析搜索页面HTML"""
+        new_posts = []
+
+        # 提取微博内容
+        pattern = r'<div class="card-feed".*?>(.*?)</div>\s*</div>'
+        cards = re.findall(pattern, html, re.DOTALL)
+
+        for card in cards[:10]:
+            try:
+                # 提取用户名
+                user_match = re.search(r'nick-name="([^"]+)"', card)
+                username = user_match.group(1) if user_match else "未知"
+
+                # 提取内容
+                content_match = re.search(r'<p class="txt".*?>(.*?)</p>', card, re.DOTALL)
+                if content_match:
+                    text = re.sub(r'<[^>]+>', '', content_match.group(1))
+                    text = text.strip()
+
+                # 提取图片
+                img_match = re.search(r'<img src="([^"]+)"[^>]*class="feed-img"', card)
+                image_url = img_match.group(1) if img_match else None
+
+                # 提取链接
+                link_match = re.search(r'<a href="([^"]+)"[^>]*class="from"', card)
+                post_url = "https://weibo.com" + link_match.group(1) if link_match else ""
+
+                if text:
+                    new_posts.append({
+                        "username": username,
+                        "uid": uid,
+                        "text": text[:500],
+                        "image_url": image_url,
+                        "created_at": "",
+                        "url": post_url,
+                    })
+            except Exception as e:
+                logger.debug(f"解析搜索结果失败: {e}")
+
+        if new_posts and uid not in self.last_post_ids:
+            self.last_post_ids[uid] = "checked"
+            self._save_state()
+
+        return new_posts
 
     def _parse_weibo_post(self, mblog: dict) -> Optional[dict]:
-        """解析微博内容"""
+        """解析微博动态（移动API格式）"""
         try:
-            # 获取文本内容
             text = mblog.get("text", "")
-            # 去除HTML标签
             text = re.sub(r'<[^>]+>', '', text)
             text = text.strip()
 
             if not text:
                 return None
 
-            # 获取用户信息
             user = mblog.get("user", {})
             username = user.get("screen_name", "未知用户")
 
-            # 获取图片
             pics = mblog.get("pics", [])
             image_url = None
             if pics:
-                # 获取第一张图片
                 first_pic = pics[0]
                 if isinstance(first_pic, dict):
                     image_url = first_pic.get("large", {}).get("url") or first_pic.get("url")
                 elif isinstance(first_pic, str):
                     image_url = first_pic
 
-            # 获取发布时间
-            created_at = mblog.get("created_at", "")
             post_url = f"https://weibo.com/{user.get('id', '')}/{mblog.get('bid', '')}"
 
             return {
                 "username": username,
                 "uid": user.get("id", ""),
-                "text": text[:500],  # 限制长度
+                "text": text[:500],
                 "image_url": image_url,
-                "created_at": created_at,
+                "created_at": mblog.get("created_at", ""),
+                "url": post_url,
+            }
+        except Exception as e:
+            logger.error(f"解析微博失败: {e}")
+            return None
+
+    def _parse_weibo_post_web(self, post: dict) -> Optional[dict]:
+        """解析微博动态（网页API格式）"""
+        try:
+            text = post.get("text", "")
+            text = re.sub(r'<[^>]+>', '', text)
+            text = text.strip()
+
+            if not text:
+                return None
+
+            user = post.get("user", {})
+            username = user.get("screen_name", "未知用户")
+
+            image_url = None
+            pics = post.get("pic_ids", [])
+            if pics:
+                image_url = f"https://wx1.sinaimg.cn/large/{pics[0]}.jpg"
+
+            post_url = f"https://weibo.com/{user.get('id', '')}/{post.get('bid', '')}"
+
+            return {
+                "username": username,
+                "uid": user.get("id", ""),
+                "text": text[:500],
+                "image_url": image_url,
+                "created_at": post.get("created_at", ""),
                 "url": post_url,
             }
         except Exception as e:
@@ -262,13 +479,9 @@ class WeiboMonitor(Star):
             return None
 
     async def _send_to_groups(self, post: dict, groups: list):
-        """发送动态到群聊"""
         message = self._format_post_message(post)
-
-        # 先发送文字
         chain = [{"type": "Plain", "text": message}]
 
-        # 如果有图片，下载并发送
         if post.get("image_url"):
             try:
                 image_path = await self._download_image(post["image_url"])
@@ -286,208 +499,136 @@ class WeiboMonitor(Star):
                 continue
 
             try:
-                await self.context.send_message(
-                    f"group_{group_id}",
-                    message_chain
-                )
+                await self.context.send_message(f"group_{group_id}", message_chain)
                 logger.info(f"已推送动态到群 {group_id}")
             except Exception as e:
                 logger.error(f"发送到群 {group_id} 失败: {e}")
 
     async def _download_image(self, url: str) -> Optional[str]:
-        """下载图片到本地"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=30) as resp:
-                    if resp.status != 200:
-                        return None
+            session = await self._get_session()
+            async with session.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}) as resp:
+                if resp.status != 200:
+                    return None
 
-                    content = await resp.read()
+                content = await resp.read()
+                img = Image.open(BytesIO(content))
+                if img.mode == "RGBA":
+                    img = img.convert("RGB")
 
-                    # 压缩图片
-                    img = Image.open(BytesIO(content))
-                    if img.mode == "RGBA":
-                        img = img.convert("RGB")
-
-                    # 保存到数据目录
-                    filename = f"weibo_image_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
-                    save_path = self.data_dir / filename
-
-                    # 压缩并保存
-                    img.save(save_path, "JPEG", quality=85, optimize=True)
-
-                    return str(save_path)
+                filename = f"weibo_{datetime.now().strftime('%H%M%S')}_{random.randint(1000,9999)}.jpg"
+                save_path = self.data_dir / filename
+                img.save(save_path, "JPEG", quality=85, optimize=True)
+                return str(save_path)
         except Exception as e:
             logger.error(f"下载图片出错: {e}")
             return None
 
     def _format_post_message(self, post: dict) -> str:
-        """格式化推送消息"""
-        msg = [
-            "【微博更新】",
-            "",
-            f"👤 {post['username']}",
-            "",
-            f"{post['text']}",
-            "",
-            f"🔗 {post['url']}",
-        ]
-        return "\n".join(msg)
+        return (
+            "【微博更新】\n\n"
+            f"👤 {post['username']}\n\n"
+            f"{post['text']}\n\n"
+            f"🔗 {post['url']}"
+        )
 
     def _parse_multiline_config(self, key: str) -> list[str]:
-        """解析多行配置"""
         value = self.config.get(key, "")
         if not value:
             return []
-        lines = [line.strip() for line in value.strip().split('\n')]
-        return [line for line in lines if line]
+        return [line.strip() for line in value.strip().split('\n') if line.strip()]
 
     # ============ 指令 ============
 
     @filter.command("微博监控")
     async def weibo_help(self, event: AstrMessageEvent):
-        """微博监控帮助"""
-        help_text = (
-            "【微博监控插件】使用说明\n\n"
-            "📌 基础指令：\n"
-            "/微博状态 - 查看当前监控状态\n"
+        yield event.plain_result(
+            "【微博监控插件v2】使用说明\n\n"
+            "📌 指令：\n"
+            "/微博状态 - 查看监控状态\n"
             "/微博测试 - 测试微博连接\n"
-            "/微博推送 - 手动触发一次推送检查\n"
-            "/微博监控 - 显示此帮助信息\n\n"
-            "⚙️ 配置说明：\n"
-            "在插件设置中配置以下参数：\n"
-            "• cookies - 微博登录Cookie\n"
-            "• watch_users - 要监控的用户UID\n"
-            "• target_groups - 推送目标群ID\n"
-            "• check_interval - 检查间隔(分钟)"
+            "/微博推送 - 手动触发检查\n"
+            "/微博监控 - 显示此帮助\n\n"
+            "⚙️ 配置：cookies、watch_users、target_groups"
         )
-        yield event.plain_result(help_text)
 
     @filter.command("微博状态")
     async def weibo_status(self, event: AstrMessageEvent):
-        """查看监控状态"""
         cookies = self.config.get("cookies", "").strip()
         watch_users = self._parse_multiline_config("watch_users")
         target_groups = self._parse_multiline_config("target_groups")
         interval = self.config.get("check_interval", 10)
-        skip_top = self.config.get("skip_top_post", True)
 
         status = [
             "【微博监控状态】",
-            "",
-            f"📡 Cookie状态: {'已配置' if cookies else '未配置 ❌'}",
-            f"👥 监控用户数: {len(watch_users)}",
-            f"💬 推送群聊数: {len(target_groups)}",
-            f"⏰ 检查间隔: {interval} 分钟",
-            f"🔝 跳过置顶: {'是' if skip_top else '否'}",
+            f"📡 Cookie: {'已配置' if cookies else '未配置 ❌'}",
+            f"👥 监控用户: {len(watch_users)}",
+            f"💬 推送群聊: {len(target_groups)}",
+            f"⏰ 检查间隔: {interval}分钟",
             "",
             "📋 监控用户:",
         ]
 
-        if watch_users:
-            for uid in watch_users[:10]:  # 最多显示10个
-                status.append(f"  • {uid}")
-            if len(watch_users) > 10:
-                status.append(f"  ... 还有 {len(watch_users) - 10} 个")
-        else:
-            status.append("  暂无")
+        for uid in watch_users[:5]:
+            status.append(f"  • {uid}")
+        if len(watch_users) > 5:
+            status.append(f"  ... 还有{len(watch_users)-5}个")
 
         yield event.plain_result("\n".join(status))
 
     @filter.command("微博测试")
     async def weibo_test(self, event: AstrMessageEvent):
-        """测试微博连接"""
         cookies = self.config.get("cookies", "").strip()
 
         if not cookies:
-            yield event.plain_result("❌ 未配置微博Cookie，请先在插件设置中配置")
+            yield event.plain_result("❌ 未配置Cookie，请在插件设置中配置")
             return
 
-        yield event.plain_result("🔄 正在测试微博连接...")
+        yield event.plain_result("🔄 正在测试微博连接（尝试多个API）...")
 
-        try:
-            watch_users = self._parse_multiline_config("watch_users")
-            test_uid = watch_users[0].strip() if watch_users else "1195230310"
+        watch_users = self._parse_multiline_config("watch_users")
+        test_uid = watch_users[0].strip() if watch_users else "1195230310"
 
-            headers = {
-                "Cookie": cookies,
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-                "MWeibo-Pwa": "1",
-                "Referer": "https://m.weibo.cn/",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            }
+        # 尝试三个API
+        for strategy_name, posts in [
+            ("移动API", await self._try_mobile_api(test_uid, cookies, True)),
+            ("网页API", await self._try_web_api(test_uid, cookies, True)),
+            ("搜索API", await self._try_search_api(test_uid, cookies, True)),
+        ]:
+            if posts:
+                post = posts[0]
+                yield event.plain_result(
+                    f"✅ 微博连接成功！\n"
+                    f"📡 使用策略: {strategy_name}\n"
+                    f"👤 用户: {post['username']}\n"
+                    f"📝 最新微博:\n{post['text'][:100]}..."
+                )
+                return
 
-            async with aiohttp.ClientSession() as session:
-                url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={test_uid}&containerid=107603{test_uid}"
-                async with session.get(url, headers=headers, timeout=15, allow_redirects=True) as resp:
-                    content_type = resp.headers.get('Content-Type', '')
+            await asyncio.sleep(1)
 
-                    # 检查是否是登录页面
-                    if 'text/html' in content_type:
-                        text = await resp.text()
-                        if '登录' in text or 'login' in text.lower():
-                            yield event.plain_result("❌ Cookie无效！微博返回登录页面，请重新获取Cookie")
-                            return
-
-                    if resp.status != 200:
-                        yield event.plain_result(f"❌ 请求失败，状态码: {resp.status}")
-                        return
-
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        yield event.plain_result("❌ 响应格式错误，无法解析JSON")
-                        return
-
-                    if data.get("ok") == 1:
-                        cards = data.get("data", {}).get("cards", [])
-                        for card in cards:
-                            if card.get("card_type") == 9:
-                                user = card.get("mblog", {}).get("user", {})
-                                text_preview = card.get("mblog", {}).get("text", "")[:100]
-                                text_preview = re.sub(r'<[^>]+>', '', text_preview)
-                                yield event.plain_result(
-                                    f"✅ 微博连接成功！\n\n"
-                                    f"👤 用户: {user.get('screen_name', '未知')}\n"
-                                    f"📝 最新微博预览:\n{text_preview}..."
-                                )
-                                return
-
-                        yield event.plain_result("⚠️ 用户暂无微博动态")
-                    else:
-                        error_msg = data.get("msg", "未知错误")
-                        yield event.plain_result(f"⚠️ API返回错误: {error_msg}")
-
-        except asyncio.TimeoutError:
-            yield event.plain_result("❌ 连接超时，请检查网络或Cookie")
-        except Exception as e:
-            yield event.plain_result(f"❌ 测试失败: {e}")
+        yield event.plain_result(
+            "❌ 所有API策略均失败\n\n"
+            "可能原因：\n"
+            "1. Cookie已过期，请重新获取\n"
+            "2. 微博账号被限制\n"
+            "3. 服务器IP被限制\n\n"
+            "建议：使用小号登录获取Cookie"
+        )
 
     @filter.command("微博推送")
     async def weibo_push(self, event: AstrMessageEvent):
-        """手动触发推送检查"""
         if self._fetch_lock:
-            yield event.plain_result("⚠️ 正在执行中，请稍后...")
+            yield event.plain_result("⚠️ 正在执行中...")
             return
 
-        yield event.plain_result("🔄 正在检查新动态...")
-
-        # 在新任务中执行，不阻塞
+        yield event.plain_result("🔄 开始检查...")
         asyncio.create_task(self._manual_push())
-
-        yield event.plain_result("✅ 已开始检查，结果将陆续推送")
+        yield event.plain_result("✅ 已开始检查")
 
     async def _manual_push(self):
-        """手动推送执行"""
         await self._check_new_posts()
-        logger.info("手动推送检查完成")
+        logger.info("手动推送完成")
 
 
-def get_astrbot_data_path():
-    """获取AstrBot数据路径的兼容函数"""
-    try:
-        from astrbot.core.utils.astrbot_path import get_astrbot_data_path as _get
-        return _get()
-    except ImportError:
-        return Path("./data")
+import time
