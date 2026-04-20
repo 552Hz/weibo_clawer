@@ -1,8 +1,14 @@
 {
+  "auto_cookie": {
+    "description": "自动获取Cookie（无需手动配置）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后自动登录获取Cookie，优先于手动配置的Cookie"
+  },
   "cookies": {
-    "description": "微博登录Cookie",
+    "description": "微博登录Cookie（可选）",
     "type": "string",
-    "hint": "登录微博后，从开发者工具复制Request Headers中的Cookie值"
+    "hint": "登录微博后，从开发者工具复制Request Headers中的Cookie值。也可留空使用自动获取"
   },
   "watch_users": {
     "description": "要监控的微博用户ID（每行一个）",

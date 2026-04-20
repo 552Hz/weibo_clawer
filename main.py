@@ -5,6 +5,7 @@
 2. 支持转发内容爬取
 3. 图片下载发送
 4. 支持私聊和群聊转发
+5. 自动获取和刷新Cookie
 """
 
 import asyncio
@@ -15,7 +16,8 @@ import random
 import time
 from pathlib import Path
 from typing import Optional, Union
-from datetime import datetime
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
 
 import aiohttp
 from PIL import Image
@@ -25,6 +27,14 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.message_components import Image as ImageSeg
+
+
+@dataclass
+class CookieManager:
+    """Cookie管理器"""
+    cookies: str = ""
+    last_updated: str = ""
+    expires_at: str = ""
 
 
 USER_AGENTS = [
@@ -51,12 +61,17 @@ class WeiboMonitor(Star):
         self.data_dir = data_dir
 
         self.state_file = data_dir / "state.json"
+        self.cookie_file = data_dir / "cookies.json"
         self.last_post_ids: dict[str, str] = {}
         self._load_state()
+        self._cookie_manager = CookieManager()
+        self._load_cookies()
 
         self._fetch_lock = False
         self._task: Optional[asyncio.Task] = None
+        self._cookie_refresh_task: Optional[asyncio.Task] = None
         self._last_request_time = 0
+        self._selenium_driver = None
         logger.info("微博监控插件v3已加载")
 
     def _load_state(self):
@@ -75,6 +90,190 @@ class WeiboMonitor(Star):
         except Exception as e:
             logger.error(f"保存状态失败: {e}")
 
+    def _load_cookies(self):
+        """加载保存的Cookie"""
+        if self.cookie_file.exists():
+            try:
+                with open(self.cookie_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self._cookie_manager = CookieManager(**data)
+                    logger.info(f"已加载Cookie，上次更新: {self._cookie_manager.last_updated}")
+            except Exception as e:
+                logger.error(f"加载Cookie失败: {e}")
+
+    def _save_cookies(self):
+        """保存Cookie到文件"""
+        try:
+            with open(self.cookie_file, 'w', encoding='utf-8') as f:
+                json.dump(asdict(self._cookie_manager), f, ensure_ascii=False, indent=2)
+            logger.info("Cookie已保存")
+        except Exception as e:
+            logger.error(f"保存Cookie失败: {e}")
+
+    def _get_active_cookies(self) -> str:
+        """获取当前可用的Cookie（优先使用自动获取的，其次使用配置的）"""
+        # 优先使用自动获取的Cookie
+        if self._cookie_manager.cookies:
+            return self._cookie_manager.cookies
+        # 备用：使用配置的静态Cookie
+        return self.config.get("cookies", "").strip()
+
+    def _is_cookie_expired(self) -> bool:
+        """检查Cookie是否需要刷新"""
+        if not self._cookie_manager.expires_at:
+            return True
+        try:
+            expires = datetime.fromisoformat(self._cookie_manager.expires_at)
+            # 提前1小时刷新
+            return datetime.now() >= (expires - timedelta(hours=1))
+        except:
+            return True
+
+    async def _init_selenium(self):
+        """初始化Selenium WebDriver"""
+        if self._selenium_driver is not None:
+            return self._selenium_driver
+
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.service import Service
+            from selenium.webdriver.chrome.options import Options
+
+            options = Options()
+            options.add_argument('--headless')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--window-size=1920,1080')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_argument('--user-agent=' + random.choice(USER_AGENTS))
+
+            self._selenium_driver = webdriver.Chrome(options=options)
+            logger.info("Selenium WebDriver 初始化成功")
+            return self._selenium_driver
+        except ImportError:
+            logger.error("未安装selenium，请运行: pip install selenium")
+            return None
+        except Exception as e:
+            logger.error(f"Selenium初始化失败: {e}")
+            return None
+
+    async def _auto_login_weibo(self) -> Optional[str]:
+        """
+        使用Selenium自动登录微博获取Cookie
+        返回Cookie字符串或None
+        """
+        driver = await self._init_selenium()
+        if not driver:
+            return None
+
+        try:
+            logger.info("开始自动登录微博...")
+
+            # 访问微博登录页
+            driver.get("https://login.sina.com.cn/signup/signin.php")
+            await asyncio.sleep(3)
+
+            # 检查是否已有有效会话
+            driver.get("https://weibo.com")
+            await asyncio.sleep(2)
+
+            # 获取当前Cookie
+            cookies = driver.get_cookies()
+            if cookies:
+                cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
+
+                # 验证Cookie是否有效
+                if await self._verify_cookies(cookie_str):
+                    logger.info("自动获取Cookie成功")
+                    return cookie_str
+
+            # 需要登录的情况
+            logger.info("检测到需要登录，请手动扫码...")
+            # 可以在这里添加二维码显示逻辑
+
+            return None
+
+        except Exception as e:
+            logger.error(f"自动登录失败: {e}")
+            return None
+        finally:
+            if self._selenium_driver:
+                try:
+                    self._selenium_driver.quit()
+                except:
+                    pass
+                self._selenium_driver = None
+
+    async def _verify_cookies(self, cookies: str) -> bool:
+        """验证Cookie是否有效"""
+        try:
+            session = await self._get_session()
+            headers = self._build_headers(cookies, "https://weibo.com/")
+            url = "https://weibo.com/ajax/statuses/mymblog?uid=1195230310&page=1"
+
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    if not self._is_login_page(text):
+                        return True
+            return False
+        except:
+            return False
+
+    async def _refresh_cookies_auto(self):
+        """自动刷新Cookie"""
+        if not self._is_cookie_expired():
+            return
+
+        logger.info("正在刷新Cookie...")
+
+        # 尝试使用已保存的会话刷新
+        if self._cookie_manager.cookies:
+            new_cookies = await self._refresh_session(self._cookie_manager.cookies)
+            if new_cookies:
+                self._cookie_manager.cookies = new_cookies
+                self._cookie_manager.last_updated = datetime.now().isoformat()
+                self._cookie_manager.expires_at = (datetime.now() + timedelta(days=7)).isoformat()
+                self._save_cookies()
+                logger.info("Cookie刷新成功")
+                return
+
+        # 尝试自动登录
+        new_cookies = await self._auto_login_weibo()
+        if new_cookies:
+            self._cookie_manager.cookies = new_cookies
+            self._cookie_manager.last_updated = datetime.now().isoformat()
+            self._cookie_manager.expires_at = (datetime.now() + timedelta(days=7)).isoformat()
+            self._save_cookies()
+            logger.info("自动登录获取Cookie成功")
+
+    async def _refresh_session(self, cookies: str) -> Optional[str]:
+        """通过刷新会话获取新Cookie"""
+        try:
+            session = await self._get_session()
+            headers = self._build_headers(cookies, "https://weibo.com/")
+            headers['X-Requested-With'] = 'XMLHttpRequest'
+
+            # 访问个人主页刷新会话
+            async with session.get("https://weibo.com/u/1195230310/home", headers=headers) as resp:
+                if resp.status == 200:
+                    return cookies
+            return None
+        except:
+            return None
+
+    def _get_cookie_from_file(self) -> Optional[str]:
+        """从文件读取Cookie"""
+        cookie_path = self.data_dir / "weibo_cookies.txt"
+        if cookie_path.exists():
+            try:
+                with open(cookie_path, 'r', encoding='utf-8') as f:
+                    return f.read().strip()
+            except:
+                pass
+        return None
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=30, connect=15)
@@ -85,7 +284,22 @@ class WeiboMonitor(Star):
     async def on_astrbot_loaded(self):
         interval = self.config.get("check_interval", 10)
         self._task = asyncio.create_task(self._monitor_loop(interval * 60))
+        # 启动Cookie刷新定时任务（每6小时检查一次）
+        self._cookie_refresh_task = asyncio.create_task(self._cookie_refresh_loop())
         logger.info(f"微博监控已启动，检查间隔: {interval} 分钟")
+
+    async def _cookie_refresh_loop(self):
+        """Cookie刷新定时循环"""
+        while True:
+            try:
+                # 每6小时检查一次
+                await asyncio.sleep(6 * 60 * 60)
+                await self._refresh_cookies_auto()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Cookie刷新循环出错: {e}")
+                await asyncio.sleep(300)
 
     async def terminate(self):
         if self._task:
@@ -93,6 +307,17 @@ class WeiboMonitor(Star):
             try:
                 await self._task
             except asyncio.CancelledError:
+                pass
+        if self._cookie_refresh_task:
+            self._cookie_refresh_task.cancel()
+            try:
+                await self._cookie_refresh_task
+            except asyncio.CancelledError:
+                pass
+        if self._selenium_driver:
+            try:
+                self._selenium_driver.quit()
+            except:
                 pass
         if self.session and not self.session.closed:
             await self.session.close()
@@ -124,7 +349,8 @@ class WeiboMonitor(Star):
 
         self._fetch_lock = True
         try:
-            cookies = self.config.get("cookies", "").strip()
+            # 获取Cookie（优先自动获取的，其次配置的）
+            cookies = self._get_active_cookies()
             if not cookies:
                 logger.warning("未配置微博Cookie，跳过检查")
                 return
@@ -531,29 +757,47 @@ class WeiboMonitor(Star):
             "/微博状态 - 查看监控状态\n"
             "/微博测试 - 测试微博连接\n"
             "/微博推送 - 手动触发检查\n"
+            "/微博登录 - 自动登录获取Cookie\n"
+            "/微博刷新Cookie - 刷新Cookie\n"
             "/微博监控 - 显示此帮助\n\n"
             "⚙️ 配置项：\n"
-            "• cookies - 微博Cookie\n"
+            "• cookies - 微博Cookie（可选，支持自动获取）\n"
             "• watch_users - 监控用户UID\n"
             "• target_groups - 推送群聊ID\n"
             "• target_users - 推送私聊用户ID\n"
             "• check_interval - 检查间隔(分钟)\n"
             "• skip_top_post - 是否跳过置顶\n"
-            "• include_retweet - 是否包含转发动态"
+            "• include_retweet - 是否包含转发动态\n\n"
+            "🔧 自动Cookie功能：\n"
+            "• 自动获取Cookie无需手动配置\n"
+            "• 每6小时自动刷新Cookie\n"
+            "• 也支持手动配置的静态Cookie"
         )
 
     @filter.command("微博状态")
     async def weibo_status(self, event: AstrMessageEvent):
-        cookies = self.config.get("cookies", "").strip()
+        static_cookies = self.config.get("cookies", "").strip()
+        auto_cookies = self._cookie_manager.cookies
         watch_users = self._parse_multiline_config("watch_users")
         target_groups = self._parse_multiline_config("target_groups")
         target_users = self._parse_multiline_config("target_users")
         interval = self.config.get("check_interval", 10)
         include_retweet = self.config.get("include_retweet", True)
 
+        # 确定使用的是哪种Cookie
+        active_cookie = self._get_active_cookies()
+        cookie_source = "自动获取" if auto_cookies == active_cookie else "手动配置"
+
         status = [
             "【微博监控状态 v3】",
-            f"📡 Cookie: {'已配置' if cookies else '未配置 ❌'}",
+            f"📡 Cookie: {'已配置' if active_cookie else '未配置 ❌'}",
+            f"   来源: {cookie_source}",
+        ]
+
+        if self._cookie_manager.last_updated:
+            status.append(f"   上次更新: {self._cookie_manager.last_updated[:19]}")
+
+        status.extend([
             f"👥 监控用户: {len(watch_users)}",
             f"💬 推送群聊: {len(target_groups)}",
             f"👤 推送私聊: {len(target_users)}",
@@ -561,7 +805,7 @@ class WeiboMonitor(Star):
             f"⏰ 检查间隔: {interval}分钟",
             "",
             "📋 监控用户:",
-        ]
+        ])
 
         for uid in watch_users[:5]:
             status.append(f"  • {uid}")
@@ -572,10 +816,10 @@ class WeiboMonitor(Star):
 
     @filter.command("微博测试")
     async def weibo_test(self, event: AstrMessageEvent):
-        cookies = self.config.get("cookies", "").strip()
+        cookies = self._get_active_cookies()
 
         if not cookies:
-            yield event.plain_result("❌ 未配置Cookie，请在插件设置中配置")
+            yield event.plain_result("❌ 未配置Cookie，请先使用 /微博登录 获取Cookie")
             return
 
         yield event.plain_result("🔄 正在测试微博连接...")
@@ -594,9 +838,54 @@ class WeiboMonitor(Star):
             yield event.plain_result(
                 "❌ 所有API策略均失败\n\n"
                 "可能原因：\n"
-                "1. Cookie已过期\n"
+                "1. Cookie已过期，请使用 /微博登录 重新获取\n"
                 "2. 微博账号被限制\n"
                 "3. 服务器IP被限制"
+            )
+
+    @filter.command("微博登录")
+    async def weibo_login(self, event: AstrMessageEvent):
+        """触发自动登录获取Cookie"""
+        yield event.plain_result("🔄 正在尝试自动登录微博获取Cookie...\n(需要服务器有Chrome浏览器和selenium支持)")
+
+        try:
+            cookies = await self._auto_login_weibo()
+            if cookies:
+                self._cookie_manager.cookies = cookies
+                self._cookie_manager.last_updated = datetime.now().isoformat()
+                self._cookie_manager.expires_at = (datetime.now() + timedelta(days=7)).isoformat()
+                self._save_cookies()
+
+                yield event.plain_result("✅ Cookie获取成功！已自动保存。")
+            else:
+                yield event.plain_result(
+                    "❌ 自动登录失败\n\n"
+                    "可能原因：\n"
+                    "1. 服务器未安装Chrome浏览器\n"
+                    "2. 未安装selenium: pip install selenium\n"
+                    "3. 需要手动配置Cookie\n\n"
+                    "请检查日志获取更多信息。"
+                )
+        except Exception as e:
+            logger.error(f"登录失败: {e}")
+            yield event.plain_result(f"❌ 登录过程出错: {str(e)}")
+
+    @filter.command("微博刷新Cookie")
+    async def weibo_refresh_cookie(self, event: AstrMessageEvent):
+        """手动刷新Cookie"""
+        yield event.plain_result("🔄 正在刷新Cookie...")
+
+        await self._refresh_cookies_auto()
+
+        if self._cookie_manager.cookies:
+            yield event.plain_result(
+                f"✅ Cookie刷新成功！\n"
+                f"更新时间: {self._cookie_manager.last_updated[:19] if self._cookie_manager.last_updated else '未知'}"
+            )
+        else:
+            yield event.plain_result(
+                "❌ Cookie刷新失败\n\n"
+                "请使用 /微博登录 手动触发登录"
             )
 
     @filter.command("微博推送")
