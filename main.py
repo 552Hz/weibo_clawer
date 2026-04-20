@@ -1,6 +1,10 @@
 """
-微博监控插件 v2
-使用高级反爬策略，多API自动切换
+微博监控插件 v3
+功能：
+1. 监控指定微博用户的新动态
+2. 支持转发内容爬取
+3. 图片下载发送
+4. 支持私聊和群聊转发
 """
 
 import asyncio
@@ -8,9 +12,9 @@ import json
 import re
 import os
 import random
-import hashlib
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from datetime import datetime
 
 import aiohttp
@@ -23,7 +27,6 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.message_components import Image as ImageSeg
 
 
-# 随机User-Agent池
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -34,7 +37,7 @@ USER_AGENTS = [
 
 
 class WeiboMonitor(Star):
-    """微博监控插件 v2"""
+    """微博监控插件 v3"""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -54,7 +57,7 @@ class WeiboMonitor(Star):
         self._fetch_lock = False
         self._task: Optional[asyncio.Task] = None
         self._last_request_time = 0
-        logger.info("微博监控插件v2已加载")
+        logger.info("微博监控插件v3已加载")
 
     def _load_state(self):
         if self.state_file.exists():
@@ -73,7 +76,6 @@ class WeiboMonitor(Star):
             logger.error(f"保存状态失败: {e}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建HTTP会话"""
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=30, connect=15)
             connector = aiohttp.TCPConnector(ssl=False, limit=10)
@@ -109,7 +111,6 @@ class WeiboMonitor(Star):
                 await asyncio.sleep(60)
 
     async def _rate_limit(self):
-        """请求限速，避免被封"""
         now = time.time()
         elapsed = now - self._last_request_time
         if elapsed < 2:
@@ -133,12 +134,17 @@ class WeiboMonitor(Star):
                 logger.warning("未配置监控用户，跳过检查")
                 return
 
+            # 获取所有目标（群聊和私聊）
             target_groups = self._parse_multiline_config("target_groups")
-            if not target_groups:
-                logger.warning("未配置目标群聊，跳过检查")
+            target_users = self._parse_multiline_config("target_users")  # 私聊用户
+            targets = self._build_targets(target_groups, target_users)
+
+            if not targets:
+                logger.warning("未配置目标，跳过检查")
                 return
 
             skip_top = self.config.get("skip_top_post", True)
+            include_retweet = self.config.get("include_retweet", True)  # 新增：是否包含转发
 
             for uid in watch_users:
                 uid = uid.strip()
@@ -147,10 +153,10 @@ class WeiboMonitor(Star):
 
                 try:
                     await self._rate_limit()
-                    new_posts = await self._fetch_user_posts(uid, cookies, skip_top)
+                    new_posts = await self._fetch_user_posts(uid, cookies, skip_top, include_retweet)
                     if new_posts:
                         for post in new_posts:
-                            await self._send_to_groups(post, target_groups)
+                            await self._send_to_targets(post, targets)
                             await asyncio.sleep(3)
                 except Exception as e:
                     logger.error(f"获取用户 {uid} 动态失败: {e}")
@@ -158,33 +164,33 @@ class WeiboMonitor(Star):
         finally:
             self._fetch_lock = False
 
-    async def _fetch_user_posts(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
-        """获取用户最新微博动态，尝试多个API"""
+    def _build_targets(self, groups: list, users: list) -> list[dict]:
+        """构建目标列表"""
+        targets = []
+        for g in groups:
+            if g.strip():
+                targets.append({"type": "group", "id": g.strip()})
+        for u in users:
+            if u.strip():
+                targets.append({"type": "private", "id": u.strip()})
+        return targets
 
-        # 策略1: 尝试移动版API
-        posts = await self._try_mobile_api(uid, cookies, skip_top)
+    async def _fetch_user_posts(self, uid: str, cookies: str, skip_top: bool, include_retweet: bool) -> list[dict]:
+        """获取用户最新微博动态"""
+        posts = await self._try_mobile_api(uid, cookies, skip_top, include_retweet)
         if posts:
             return posts
 
-        # 策略2: 尝试网页版API
-        posts = await self._try_web_api(uid, cookies, skip_top)
+        posts = await self._try_web_api(uid, cookies, skip_top, include_retweet)
         if posts:
             return posts
 
-        # 策略3: 尝试搜索API
-        posts = await self._try_search_api(uid, cookies, skip_top)
-        if posts:
-            return posts
-
-        logger.warning(f"所有API策略均失败，用户: {uid}")
         return []
 
-    async def _try_mobile_api(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
-        """策略1: 移动版API"""
+    async def _try_mobile_api(self, uid: str, cookies: str, skip_top: bool, include_retweet: bool) -> list[dict]:
         try:
             session = await self._get_session()
             headers = self._build_headers(cookies, "https://m.weibo.cn/")
-
             url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page=1"
 
             async with session.get(url, headers=headers) as resp:
@@ -204,19 +210,16 @@ class WeiboMonitor(Star):
                 if data.get("ok") != 1:
                     return []
 
-                return self._parse_cards(data.get("data", {}).get("cards", []), uid, skip_top)
+                return self._parse_cards_v3(data.get("data", {}).get("cards", []), uid, skip_top, include_retweet)
         except Exception as e:
             logger.debug(f"移动API失败: {e}")
             return []
 
-    async def _try_web_api(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
-        """策略2: 网页版Ajax API"""
+    async def _try_web_api(self, uid: str, cookies: str, skip_top: bool, include_retweet: bool) -> list[dict]:
         try:
             session = await self._get_session()
             headers = self._build_headers(cookies, f"https://weibo.com/u/{uid}")
             headers["X-Requested-With"] = "XMLHttpRequest"
-            headers["X-Requested-With"] = "fetch"
-
             url = f"https://weibo.com/ajax/statuses/mymblog?uid={uid}&page=1&feature=0"
 
             async with session.get(url, headers=headers) as resp:
@@ -237,57 +240,12 @@ class WeiboMonitor(Star):
                     return []
 
                 posts = data.get("data", {}).get("list", [])
-                return self._parse_posts_list(posts, uid, skip_top)
+                return self._parse_posts_list_v3(posts, uid, skip_top, include_retweet)
         except Exception as e:
             logger.debug(f"网页API失败: {e}")
             return []
 
-    async def _try_search_api(self, uid: str, cookies: str, skip_top: bool) -> list[dict]:
-        """策略3: 搜索API，通过uid获取用户名后再搜索"""
-        try:
-            # 先获取用户名
-            username = await self._get_username(uid, cookies)
-            if not username:
-                return []
-
-            session = await self._get_session()
-            headers = self._build_headers(cookies, "https://s.weibo.com")
-
-            # 使用搜索API
-            search_url = f"https://s.weibo.com/weibo?q=from%3A{username}&Refer=SWeibo_box"
-            encoded_url = f"https://s.weibo.com/weibo?q=from%3A{username}&typeall=1&suball=1&timescope=custom:recent&Refer=index"
-
-            async with session.get(encoded_url, headers=headers) as resp:
-                text = await resp.text()
-                if self._is_login_page(text):
-                    logger.warning("搜索API: Cookie无效")
-                    return []
-
-                # 解析搜索结果页面
-                return self._parse_search_page(text, uid, skip_top)
-        except Exception as e:
-            logger.debug(f"搜索API失败: {e}")
-            return []
-
-    async def _get_username(self, uid: str, cookies: str) -> Optional[str]:
-        """获取微博用户名"""
-        try:
-            session = await self._get_session()
-            headers = self._build_headers(cookies, f"https://weibo.com/u/{uid}")
-            headers["Accept"] = "application/json"
-
-            url = f"https://weibo.com/ajax/profile/info?uid={uid}"
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = json.loads(await resp.text())
-                    if data.get("ok") == 1:
-                        return data.get("data", {}).get("user", {}).get("screen_name")
-        except:
-            pass
-        return None
-
     def _build_headers(self, cookies: str, referer: str) -> dict:
-        """构建完整的请求头"""
         return {
             "Cookie": cookies,
             "User-Agent": random.choice(USER_AGENTS),
@@ -296,23 +254,23 @@ class WeiboMonitor(Star):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
-            "Cache-Control": "max-age=0",
-            "Upgrade-Insecure-Requests": "1",
         }
 
     def _is_login_page(self, text: str) -> bool:
-        """检测是否是登录页面"""
         text_lower = text.lower()
-        login_indicators = ['登录', 'login', 'passport.weibo', 'sso.weibo', '请先登录']
-        return any(indicator.lower() in text_lower for indicator in login_indicators)
+        return any(x in text_lower for x in ['登录', 'login', 'passport.weibo', '请先登录'])
 
-    def _parse_cards(self, cards: list, uid: str, skip_top: bool) -> list[dict]:
-        """解析移动API的cards"""
+    def _parse_cards_v3(self, cards: list, uid: str, skip_top: bool, include_retweet: bool) -> list[dict]:
+        """解析移动API的cards，支持转发"""
         new_posts = []
         seen_ids = set()
 
         for card in cards:
-            if card.get("card_type") != 9:
+            card_type = card.get("card_type", 0)
+
+            # 普通微博: card_type=9
+            # 转发微博: card_type=9, mblog里有retweet
+            if card_type != 9:
                 continue
 
             mblog = card.get("mblog", {})
@@ -325,10 +283,25 @@ class WeiboMonitor(Star):
             if skip_top and mblog.get("isTop"):
                 continue
 
+            # 检查是否已推送过
             if uid in self.last_post_ids and self.last_post_ids[uid] == post_id:
                 break
 
-            post_data = self._parse_weibo_post(mblog)
+            # 解析原微博（可能被转发的）
+            post_data = self._parse_weibo_post_v3(mblog)
+
+            # 处理转发内容
+            retweet = mblog.get("retweeted_status")
+            if retweet and include_retweet:
+                retweet_data = self._parse_weibo_post_v3(retweet)
+                post_data["is_retweet"] = True
+                post_data["original_user"] = retweet_data["username"]
+                post_data["original_text"] = retweet_data["text"]
+                post_data["original_url"] = retweet_data["url"]
+                # 如果原微博有图片，用原微博的图片
+                if retweet_data["image_url"]:
+                    post_data["image_url"] = retweet_data["image_url"]
+
             if post_data:
                 new_posts.append(post_data)
 
@@ -341,8 +314,8 @@ class WeiboMonitor(Star):
 
         return new_posts
 
-    def _parse_posts_list(self, posts: list, uid: str, skip_top: bool) -> list[dict]:
-        """解析网页API的posts list"""
+    def _parse_posts_list_v3(self, posts: list, uid: str, skip_top: bool, include_retweet: bool) -> list[dict]:
+        """解析网页API的posts list，支持转发"""
         new_posts = []
 
         for post in posts:
@@ -354,7 +327,19 @@ class WeiboMonitor(Star):
             if uid in self.last_post_ids and self.last_post_ids[uid] == post_id:
                 break
 
-            post_data = self._parse_weibo_post_web(post)
+            post_data = self._parse_weibo_post_web_v3(post)
+
+            # 处理转发
+            retweet = post.get("retweeted_status")
+            if retweet and include_retweet:
+                retweet_data = self._parse_weibo_post_web_v3(retweet)
+                post_data["is_retweet"] = True
+                post_data["original_user"] = retweet_data["username"]
+                post_data["original_text"] = retweet_data["text"]
+                post_data["original_url"] = retweet_data["url"]
+                if retweet_data["image_url"]:
+                    post_data["image_url"] = retweet_data["image_url"]
+
             if post_data:
                 new_posts.append(post_data)
 
@@ -364,53 +349,7 @@ class WeiboMonitor(Star):
 
         return new_posts
 
-    def _parse_search_page(self, html: str, uid: str, skip_top: bool) -> list[dict]:
-        """解析搜索页面HTML"""
-        new_posts = []
-
-        # 提取微博内容
-        pattern = r'<div class="card-feed".*?>(.*?)</div>\s*</div>'
-        cards = re.findall(pattern, html, re.DOTALL)
-
-        for card in cards[:10]:
-            try:
-                # 提取用户名
-                user_match = re.search(r'nick-name="([^"]+)"', card)
-                username = user_match.group(1) if user_match else "未知"
-
-                # 提取内容
-                content_match = re.search(r'<p class="txt".*?>(.*?)</p>', card, re.DOTALL)
-                if content_match:
-                    text = re.sub(r'<[^>]+>', '', content_match.group(1))
-                    text = text.strip()
-
-                # 提取图片
-                img_match = re.search(r'<img src="([^"]+)"[^>]*class="feed-img"', card)
-                image_url = img_match.group(1) if img_match else None
-
-                # 提取链接
-                link_match = re.search(r'<a href="([^"]+)"[^>]*class="from"', card)
-                post_url = "https://weibo.com" + link_match.group(1) if link_match else ""
-
-                if text:
-                    new_posts.append({
-                        "username": username,
-                        "uid": uid,
-                        "text": text[:500],
-                        "image_url": image_url,
-                        "created_at": "",
-                        "url": post_url,
-                    })
-            except Exception as e:
-                logger.debug(f"解析搜索结果失败: {e}")
-
-        if new_posts and uid not in self.last_post_ids:
-            self.last_post_ids[uid] = "checked"
-            self._save_state()
-
-        return new_posts
-
-    def _parse_weibo_post(self, mblog: dict) -> Optional[dict]:
+    def _parse_weibo_post_v3(self, mblog: dict) -> Optional[dict]:
         """解析微博动态（移动API格式）"""
         try:
             text = mblog.get("text", "")
@@ -423,8 +362,9 @@ class WeiboMonitor(Star):
             user = mblog.get("user", {})
             username = user.get("screen_name", "未知用户")
 
-            pics = mblog.get("pics", [])
+            # 获取图片
             image_url = None
+            pics = mblog.get("pics", [])
             if pics:
                 first_pic = pics[0]
                 if isinstance(first_pic, dict):
@@ -433,20 +373,22 @@ class WeiboMonitor(Star):
                     image_url = first_pic
 
             post_url = f"https://weibo.com/{user.get('id', '')}/{mblog.get('bid', '')}"
+            created_at = mblog.get("created_at", "")
 
             return {
                 "username": username,
                 "uid": user.get("id", ""),
                 "text": text[:500],
                 "image_url": image_url,
-                "created_at": mblog.get("created_at", ""),
+                "created_at": created_at,
                 "url": post_url,
+                "is_retweet": False,
             }
         except Exception as e:
             logger.error(f"解析微博失败: {e}")
             return None
 
-    def _parse_weibo_post_web(self, post: dict) -> Optional[dict]:
+    def _parse_weibo_post_web_v3(self, post: dict) -> Optional[dict]:
         """解析微博动态（网页API格式）"""
         try:
             text = post.get("text", "")
@@ -462,26 +404,35 @@ class WeiboMonitor(Star):
             image_url = None
             pics = post.get("pic_ids", [])
             if pics:
-                image_url = f"https://wx1.sinaimg.cn/large/{pics[0]}.jpg"
+                picid = pics[0]
+                # 尝试多种图片尺寸
+                for size in ['large', 'mw2000', 'mw1080', 'mw690', 'orj360', 'square']:
+                    image_url = f"https://wx1.sinaimg.cn/{size}/{picid}.jpg"
+                    break
 
             post_url = f"https://weibo.com/{user.get('id', '')}/{post.get('bid', '')}"
+            created_at = post.get("created_at", "")
 
             return {
                 "username": username,
                 "uid": user.get("id", ""),
                 "text": text[:500],
                 "image_url": image_url,
-                "created_at": post.get("created_at", ""),
+                "created_at": created_at,
                 "url": post_url,
+                "is_retweet": False,
             }
         except Exception as e:
             logger.error(f"解析微博失败: {e}")
             return None
 
-    async def _send_to_groups(self, post: dict, groups: list):
-        message = self._format_post_message(post)
+    async def _send_to_targets(self, post: dict, targets: list):
+        """发送动态到所有目标（群聊和私聊）"""
+        message = self._format_post_message_v3(post)
+
         chain = [{"type": "Plain", "text": message}]
 
+        # 如果有图片，下载并添加
         if post.get("image_url"):
             try:
                 image_path = await self._download_image(post["image_url"])
@@ -493,18 +444,25 @@ class WeiboMonitor(Star):
         from astrbot.api.event import MessageChain
         message_chain = MessageChain().from_dict(chain)
 
-        for group_id in groups:
-            group_id = group_id.strip()
-            if not group_id:
-                continue
+        for target in targets:
+            target_type = target["type"]
+            target_id = target["id"]
 
             try:
-                await self.context.send_message(f"group_{group_id}", message_chain)
-                logger.info(f"已推送动态到群 {group_id}")
+                if target_type == "group":
+                    identifier = f"group_{target_id}"
+                else:
+                    identifier = f"private_{target_id}"
+
+                await self.context.send_message(identifier, message_chain)
+                logger.info(f"已推送动态到 {target_type} {target_id}")
             except Exception as e:
-                logger.error(f"发送到群 {group_id} 失败: {e}")
+                logger.error(f"发送到 {target_type} {target_id} 失败: {e}")
+
+            await asyncio.sleep(1)
 
     async def _download_image(self, url: str) -> Optional[str]:
+        """下载并压缩图片"""
         try:
             session = await self._get_session()
             async with session.get(url, headers={"User-Agent": random.choice(USER_AGENTS)}) as resp:
@@ -513,24 +471,49 @@ class WeiboMonitor(Star):
 
                 content = await resp.read()
                 img = Image.open(BytesIO(content))
+
                 if img.mode == "RGBA":
                     img = img.convert("RGB")
 
                 filename = f"weibo_{datetime.now().strftime('%H%M%S')}_{random.randint(1000,9999)}.jpg"
                 save_path = self.data_dir / filename
+
                 img.save(save_path, "JPEG", quality=85, optimize=True)
                 return str(save_path)
         except Exception as e:
             logger.error(f"下载图片出错: {e}")
             return None
 
-    def _format_post_message(self, post: dict) -> str:
-        return (
-            "【微博更新】\n\n"
-            f"👤 {post['username']}\n\n"
-            f"{post['text']}\n\n"
-            f"🔗 {post['url']}"
-        )
+    def _format_post_message_v3(self, post: dict) -> str:
+        """格式化推送消息 v3"""
+        username = post["username"]
+
+        # 如果是转发，显示原文作者
+        if post.get("is_retweet"):
+            original_user = post.get("original_user", "未知")
+            original_text = post.get("original_text", "")[:200]
+            original_url = post.get("original_url", "")
+
+            msg = (
+                f"🔄 {username} 转发了一条微博！\n\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"📝 转发言论:\n{post['text'][:200]}\n\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"🔁 原文来自 @{original_user}:\n"
+                f"{original_text}\n"
+                f"🔗 {original_url}\n"
+                f"━━━━━━━━━━━━━━━━"
+            )
+        else:
+            msg = (
+                f"🔔 {username} 更新微博啦！\n\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"{post['text']}\n\n"
+                f"🔗 {post['url']}\n"
+                f"━━━━━━━━━━━━━━━━"
+            )
+
+        return msg
 
     def _parse_multiline_config(self, key: str) -> list[str]:
         value = self.config.get(key, "")
@@ -543,13 +526,20 @@ class WeiboMonitor(Star):
     @filter.command("微博监控")
     async def weibo_help(self, event: AstrMessageEvent):
         yield event.plain_result(
-            "【微博监控插件v2】使用说明\n\n"
+            "【微博监控插件v3】使用说明\n\n"
             "📌 指令：\n"
             "/微博状态 - 查看监控状态\n"
             "/微博测试 - 测试微博连接\n"
             "/微博推送 - 手动触发检查\n"
             "/微博监控 - 显示此帮助\n\n"
-            "⚙️ 配置：cookies、watch_users、target_groups"
+            "⚙️ 配置项：\n"
+            "• cookies - 微博Cookie\n"
+            "• watch_users - 监控用户UID\n"
+            "• target_groups - 推送群聊ID\n"
+            "• target_users - 推送私聊用户ID\n"
+            "• check_interval - 检查间隔(分钟)\n"
+            "• skip_top_post - 是否跳过置顶\n"
+            "• include_retweet - 是否包含转发动态"
         )
 
     @filter.command("微博状态")
@@ -557,13 +547,17 @@ class WeiboMonitor(Star):
         cookies = self.config.get("cookies", "").strip()
         watch_users = self._parse_multiline_config("watch_users")
         target_groups = self._parse_multiline_config("target_groups")
+        target_users = self._parse_multiline_config("target_users")
         interval = self.config.get("check_interval", 10)
+        include_retweet = self.config.get("include_retweet", True)
 
         status = [
-            "【微博监控状态】",
+            "【微博监控状态 v3】",
             f"📡 Cookie: {'已配置' if cookies else '未配置 ❌'}",
             f"👥 监控用户: {len(watch_users)}",
             f"💬 推送群聊: {len(target_groups)}",
+            f"👤 推送私聊: {len(target_users)}",
+            f"🔄 包含转发: {'是' if include_retweet else '否'}",
             f"⏰ 检查间隔: {interval}分钟",
             "",
             "📋 监控用户:",
@@ -584,37 +578,26 @@ class WeiboMonitor(Star):
             yield event.plain_result("❌ 未配置Cookie，请在插件设置中配置")
             return
 
-        yield event.plain_result("🔄 正在测试微博连接（尝试多个API）...")
+        yield event.plain_result("🔄 正在测试微博连接...")
 
         watch_users = self._parse_multiline_config("watch_users")
         test_uid = watch_users[0].strip() if watch_users else "1195230310"
 
-        # 尝试三个API
-        for strategy_name, posts in [
-            ("移动API", await self._try_mobile_api(test_uid, cookies, True)),
-            ("网页API", await self._try_web_api(test_uid, cookies, True)),
-            ("搜索API", await self._try_search_api(test_uid, cookies, True)),
-        ]:
-            if posts:
-                post = posts[0]
-                yield event.plain_result(
-                    f"✅ 微博连接成功！\n"
-                    f"📡 使用策略: {strategy_name}\n"
-                    f"👤 用户: {post['username']}\n"
-                    f"📝 最新微博:\n{post['text'][:100]}..."
-                )
-                return
-
-            await asyncio.sleep(1)
-
-        yield event.plain_result(
-            "❌ 所有API策略均失败\n\n"
-            "可能原因：\n"
-            "1. Cookie已过期，请重新获取\n"
-            "2. 微博账号被限制\n"
-            "3. 服务器IP被限制\n\n"
-            "建议：使用小号登录获取Cookie"
-        )
+        posts = await self._fetch_user_posts(test_uid, cookies, True, True)
+        if posts:
+            post = posts[0]
+            msg = f"✅ 微博连接成功！\n\n👤 用户: {post['username']}\n📝 最新微博:\n{post['text'][:150]}..."
+            if post.get("is_retweet"):
+                msg += f"\n🔄 (转发自 @{post.get('original_user', '')})"
+            yield event.plain_result(msg)
+        else:
+            yield event.plain_result(
+                "❌ 所有API策略均失败\n\n"
+                "可能原因：\n"
+                "1. Cookie已过期\n"
+                "2. 微博账号被限制\n"
+                "3. 服务器IP被限制"
+            )
 
     @filter.command("微博推送")
     async def weibo_push(self, event: AstrMessageEvent):
@@ -629,6 +612,3 @@ class WeiboMonitor(Star):
     async def _manual_push(self):
         await self._check_new_posts()
         logger.info("手动推送完成")
-
-
-import time

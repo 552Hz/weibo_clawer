@@ -1,29 +1,39 @@
 {
   "cookies": {
-    "description": "微博登录Cookie，用于获取用户动态",
+    "description": "微博登录Cookie",
     "type": "string",
-    "hint": "在微博网页登录后，从开发者工具中复制Request Headers中的Cookie值"
+    "hint": "登录微博后，从开发者工具复制Request Headers中的Cookie值"
   },
   "watch_users": {
-    "description": "要监控的微博用户ID列表（每行一个）",
+    "description": "要监控的微博用户ID（每行一个）",
     "type": "text",
-    "hint": "填写微博用户的数字ID，如 1195230310（可从用户主页URL获取）"
+    "hint": "填写微博数字ID，如 1195230310（从主页URL获取）"
   },
   "target_groups": {
-    "description": "推送目标群聊ID列表（每行一个）",
+    "description": "推送目标群聊ID（每行一个）",
     "type": "text",
-    "hint": "填写要接收推送的群聊ID"
+    "hint": "填写接收推送的群聊ID"
+  },
+  "target_users": {
+    "description": "推送目标私聊用户ID（每行一个）",
+    "type": "text",
+    "hint": "填写接收推送的私聊用户ID"
   },
   "check_interval": {
     "description": "检查间隔（分钟）",
     "type": "int",
     "default": 10,
-    "hint": "每次检查新动态的时间间隔，建议10-30分钟"
+    "hint": "建议10-30分钟"
   },
   "skip_top_post": {
     "description": "跳过置顶动态",
     "type": "bool",
+    "default": true
+  },
+  "include_retweet": {
+    "description": "包含转发动态",
+    "type": "bool",
     "default": true,
-    "hint": "是否跳过用户置顶的微博"
+    "hint": "是否爬取用户的转发动态"
   }
 }
