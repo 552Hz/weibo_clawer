@@ -144,21 +144,38 @@ class WeiboMonitor(Star):
         """获取用户最新微博动态"""
         headers = {
             "Cookie": cookies,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": f"https://weibo.com/u/{uid}",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "MWeibo-Pwa": "1",
+            "Referer": "https://m.weibo.cn/",
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
         }
 
         async with aiohttp.ClientSession() as session:
             # 使用微博API获取用户最新微博
-            url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}"
+            url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page=1"
 
-            async with session.get(url, headers=headers, timeout=30) as resp:
+            async with session.get(url, headers=headers, timeout=30, allow_redirects=True) as resp:
+                content_type = resp.headers.get('Content-Type', '')
+
+                # 检查是否是登录页面
+                if 'text/html' in content_type or resp.status == 200:
+                    text = await resp.text()
+                    if '登录' in text or 'login' in text.lower() or '<!DOCTYPE html>' in text[:50]:
+                        logger.warning("Cookie无效，微博返回登录页面")
+                        return []
+
                 if resp.status != 200:
                     logger.error(f"请求失败，状态码: {resp.status}")
                     return []
 
-                data = await resp.json()
+                try:
+                    data = await resp.json()
+                except Exception:
+                    text = await resp.text()
+                    logger.error(f"JSON解析失败，响应: {text[:200]}")
+                    return []
 
                 if data.get("ok") != 1:
                     logger.warning(f"获取用户 {uid} 动态失败: {data}")
@@ -389,38 +406,61 @@ class WeiboMonitor(Star):
         yield event.plain_result("🔄 正在测试微博连接...")
 
         try:
-            # 测试获取一个用户的信息
             watch_users = self._parse_multiline_config("watch_users")
-            test_uid = watch_users[0].strip() if watch_users else "1195230310"  # 默认测试账号
+            test_uid = watch_users[0].strip() if watch_users else "1195230310"
 
             headers = {
                 "Cookie": cookies,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                "MWeibo-Pwa": "1",
+                "Referer": "https://m.weibo.cn/",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             }
 
             async with aiohttp.ClientSession() as session:
                 url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={test_uid}&containerid=107603{test_uid}"
-                async with session.get(url, headers=headers, timeout=15) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("ok") == 1:
-                            cards = data.get("data", {}).get("cards", [])
-                            for card in cards:
-                                if card.get("card_type") == 9:
-                                    user = card.get("mblog", {}).get("user", {})
-                                    yield event.plain_result(
-                                        f"✅ 微博连接成功！\n"
-                                        f"👤 测试用户: {user.get('screen_name', '未知')}\n"
-                                        f"📝 最新微博获取正常"
-                                    )
-                                    return
+                async with session.get(url, headers=headers, timeout=15, allow_redirects=True) as resp:
+                    content_type = resp.headers.get('Content-Type', '')
 
-                        yield event.plain_result(f"⚠️ 获取数据异常: {data}")
-                    else:
+                    # 检查是否是登录页面
+                    if 'text/html' in content_type:
+                        text = await resp.text()
+                        if '登录' in text or 'login' in text.lower():
+                            yield event.plain_result("❌ Cookie无效！微博返回登录页面，请重新获取Cookie")
+                            return
+
+                    if resp.status != 200:
                         yield event.plain_result(f"❌ 请求失败，状态码: {resp.status}")
+                        return
+
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        yield event.plain_result("❌ 响应格式错误，无法解析JSON")
+                        return
+
+                    if data.get("ok") == 1:
+                        cards = data.get("data", {}).get("cards", [])
+                        for card in cards:
+                            if card.get("card_type") == 9:
+                                user = card.get("mblog", {}).get("user", {})
+                                text_preview = card.get("mblog", {}).get("text", "")[:100]
+                                text_preview = re.sub(r'<[^>]+>', '', text_preview)
+                                yield event.plain_result(
+                                    f"✅ 微博连接成功！\n\n"
+                                    f"👤 用户: {user.get('screen_name', '未知')}\n"
+                                    f"📝 最新微博预览:\n{text_preview}..."
+                                )
+                                return
+
+                        yield event.plain_result("⚠️ 用户暂无微博动态")
+                    else:
+                        error_msg = data.get("msg", "未知错误")
+                        yield event.plain_result(f"⚠️ API返回错误: {error_msg}")
 
         except asyncio.TimeoutError:
-            yield event.plain_result("❌ 连接超时，请检查网络")
+            yield event.plain_result("❌ 连接超时，请检查网络或Cookie")
         except Exception as e:
             yield event.plain_result(f"❌ 测试失败: {e}")
 
