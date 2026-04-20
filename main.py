@@ -71,7 +71,7 @@ class WeiboMonitor(Star):
         self._task: Optional[asyncio.Task] = None
         self._cookie_refresh_task: Optional[asyncio.Task] = None
         self._last_request_time = 0
-        self._playwright_browser = None
+        self._selenium_driver = None
         logger.info("微博监控插件v3已加载")
 
     def _load_state(self):
@@ -129,51 +129,55 @@ class WeiboMonitor(Star):
         except:
             return True
 
-    async def _init_playwright(self):
-        """初始化Playwright浏览器"""
-        if self._playwright_browser is not None:
-            return self._playwright_browser
+    async def _init_selenium(self):
+        """初始化Selenium WebDriver"""
+        if self._selenium_driver is not None:
+            return self._selenium_driver
 
         try:
-            from playwright.async_api import async_playwright
+            from selenium import webdriver
+            from selenium.webdriver.chrome.service import Service
+            from selenium.webdriver.chrome.options import Options
+            import platform
 
-            playwright = await async_playwright().start()
-            self._playwright_browser = await playwright.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-blink-features=AutomationControlled',
-                ]
-            )
-            logger.info("Playwright 浏览器初始化成功")
-            return self._playwright_browser
+            options = Options()
+            options.add_argument('--headless=new')
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--window-size=1920,1080')
+            options.add_argument('--disable-blink-features=AutomationControlled')
+            options.add_argument('--user-agent=' + random.choice(USER_AGENTS))
+            options.add_argument('--lang=zh-CN')
+
+            self._selenium_driver = webdriver.Chrome(options=options)
+            self._selenium_driver.set_page_load_timeout(30)
+            self._selenium_driver.implicitly_wait(10)
+            logger.info(f"Selenium WebDriver 初始化成功 (平台: {platform.system()})")
+            return self._selenium_driver
         except ImportError:
-            logger.error("未安装playwright，请运行: pip install playwright && playwright install chromium")
+            logger.error("未安装selenium，请运行: pip install selenium")
             return None
         except Exception as e:
-            logger.error(f"Playwright初始化失败: {e}")
+            logger.error(f"Selenium初始化失败: {e}")
             return None
 
     async def _auto_login_weibo(self) -> Optional[str]:
         """
-        使用Playwright自动登录微博获取Cookie
+        使用Selenium自动登录微博获取Cookie
         返回Cookie字符串或None
         """
-        browser = await self._init_playwright()
-        if not browser:
+        driver = await self._init_selenium()
+        if not driver:
             return None
 
-        page = None
         try:
             logger.info("开始自动登录微博...")
-            page = await browser.new_page()
 
-            await page.goto("https://weibo.com", wait_until="networkidle")
-            await page.wait_for_timeout(3000)
+            driver.get("https://weibo.com")
+            await asyncio.sleep(3)
 
-            cookies = await page.context.cookies()
+            cookies = driver.get_cookies()
             if cookies:
                 cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
 
@@ -188,8 +192,12 @@ class WeiboMonitor(Star):
             logger.error(f"自动登录失败: {e}")
             return None
         finally:
-            if page:
-                await page.close()
+            if self._selenium_driver:
+                try:
+                    self._selenium_driver.quit()
+                except:
+                    pass
+                self._selenium_driver = None
 
     async def _verify_cookies(self, cookies: str) -> bool:
         """验证Cookie是否有效"""
@@ -300,9 +308,9 @@ class WeiboMonitor(Star):
                 await self._cookie_refresh_task
             except asyncio.CancelledError:
                 pass
-        if self._playwright_browser:
+        if self._selenium_driver:
             try:
-                await self._playwright_browser.close()
+                self._selenium_driver.quit()
             except:
                 pass
         if self.session and not self.session.closed:
@@ -832,7 +840,7 @@ class WeiboMonitor(Star):
     @filter.command("微博登录")
     async def weibo_login(self, event: AstrMessageEvent):
         """触发自动登录获取Cookie"""
-        yield event.plain_result("🔄 正在尝试自动登录微博获取Cookie...\n(需要服务器有playwright支持)")
+        yield event.plain_result("🔄 正在尝试自动登录微博获取Cookie...\n(需要服务器有Chrome浏览器和selenium支持)")
 
         try:
             cookies = await self._auto_login_weibo()
@@ -847,8 +855,8 @@ class WeiboMonitor(Star):
                 yield event.plain_result(
                     "❌ 自动登录失败\n\n"
                     "可能原因：\n"
-                    "1. 服务器未安装浏览器: playwright install chromium\n"
-                    "2. 未安装playwright: pip install playwright\n"
+                    "1. 服务器未安装Chrome浏览器\n"
+                    "2. 未安装selenium: pip install selenium\n"
                     "3. 需要手动配置Cookie\n\n"
                     "请检查日志获取更多信息。"
                 )

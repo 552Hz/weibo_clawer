@@ -16,7 +16,14 @@ AstrBot 微博监控插件，定时爬取指定微博用户的新动态并推送
 ## 安装
 
 1. 下载插件ZIP并解压到 AstrBot 插件目录
-2. 在 AstrBot WebUI 中配置插件参数
+2. 安装依赖：`pip install -r requirements.txt`
+3. 确保服务器已安装 Chrome 浏览器
+4. 在 AstrBot WebUI 中配置插件参数
+
+## 依赖要求
+
+- **Chrome 浏览器**：用于 Selenium 自动登录
+- Python 依赖：见 `requirements.txt`
 
 ## 配置说明
 
@@ -68,6 +75,8 @@ AstrBot 微博监控插件，定时爬取指定微博用户的新动态并推送
 | `/微博状态` | 查看当前监控状态 |
 | `/微博测试` | 测试微博连接 |
 | `/微博推送` | 手动触发一次检查 |
+| `/微博登录` | 自动登录微博获取Cookie（需要Chrome浏览器和selenium） |
+| `/微博刷新Cookie` | 手动刷新Cookie |
 
 ## 推送消息格式
 
@@ -102,3 +111,11 @@ AstrBot 微博监控插件，定时爬取指定微博用户的新动态并推送
 - 建议使用小号登录微博获取 Cookie
 - 图片会自动压缩以适应平台限制
 - 同一用户的新动态只会推送一次
+
+## 自动登录
+
+插件支持自动登录微博获取 Cookie，使用命令 `/微博登录` 即可。
+
+**要求：**
+- 服务器已安装 Chrome 浏览器
+- 已安装 selenium：`pip install selenium`
