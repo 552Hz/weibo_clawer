@@ -1,0 +1,29 @@
+{
+  "cookies": {
+    "description": "微博登录Cookie，用于获取用户动态",
+    "type": "string",
+    "hint": "在微博网页登录后，从开发者工具中复制Request Headers中的Cookie值"
+  },
+  "watch_users": {
+    "description": "要监控的微博用户ID列表（每行一个）",
+    "type": "text",
+    "hint": "填写微博用户的数字ID，如 1195230310（可从用户主页URL获取）"
+  },
+  "target_groups": {
+    "description": "推送目标群聊ID列表（每行一个）",
+    "type": "text",
+    "hint": "填写要接收推送的群聊ID"
+  },
+  "check_interval": {
+    "description": "检查间隔（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "每次检查新动态的时间间隔，建议10-30分钟"
+  },
+  "skip_top_post": {
+    "description": "跳过置顶动态",
+    "type": "bool",
+    "default": true,
+    "hint": "是否跳过用户置顶的微博"
+  }
+}

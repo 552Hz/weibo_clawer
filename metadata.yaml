@@ -1,0 +1,9 @@
+name: astrbot_plugin_weibo
+version: 1.0.0
+author: Your Name
+description: 微博监控插件，定时爬取指定用户的新动态并推送到群聊
+display_name: 微博监控
+support_platforms:
+  - aiocqhttp
+  - qq_official
+astrbot_version: ">=4.9.2"
