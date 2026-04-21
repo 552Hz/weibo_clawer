@@ -147,8 +147,6 @@ class WeiboMonitor(Star):
                     '--disable-gpu',
                     '--disable-blink-features=AutomationControlled',
                     '--disable-setuid-sandbox',
-                    '--disable-web-security',
-                    '--user-data-dir=/tmp/chrome-data',
                 ]
             )
             logger.info(f"Playwright 浏览器初始化成功 (平台: {platform.system()})")
@@ -231,12 +229,25 @@ class WeiboMonitor(Star):
         """验证Cookie是否有效"""
         try:
             session = await self._get_session()
-            headers = self._build_headers(cookies, "https://weibo.com/")
-            url = "https://weibo.com/ajax/statuses/mymblog?uid=1195230310&page=1"
+            # 使用移动端API验证，更稳定
+            headers = {
+                "Cookie": cookies,
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                "Referer": "https://m.weibo.cn/",
+                "MWeibo-Pwa": "1",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value=1195230310&containerid=1076031195230310&page=1"
 
             async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                        if data.get("ok") == 1:
+                            return True
+                    except:
+                        pass
                     if not self._is_login_page(text):
                         return True
             return False
@@ -271,16 +282,34 @@ class WeiboMonitor(Star):
             logger.info("自动登录获取Cookie成功")
 
     async def _refresh_session(self, cookies: str) -> Optional[str]:
-        """通过刷新会话获取新Cookie"""
+        """通过刷新会话获取新Cookie（使用移动端API）"""
         try:
             session = await self._get_session()
-            headers = self._build_headers(cookies, "https://weibo.com/")
-            headers['X-Requested-With'] = 'XMLHttpRequest'
 
-            # 访问个人主页刷新会话
-            async with session.get("https://weibo.com/u/1195230310/home", headers=headers) as resp:
+            # 获取配置的监控用户UID
+            watch_users = self._parse_multiline_config("watch_users")
+            uid = watch_users[0].strip() if watch_users else "1195230310"
+
+            # 使用移动端API刷新会话
+            headers = {
+                "Cookie": cookies,
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                "Referer": "https://m.weibo.cn/",
+                "MWeibo-Pwa": "1",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}&containerid=107603{uid}&page=1"
+
+            async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
-                    return cookies
+                    text = await resp.text()
+                    try:
+                        data = json.loads(text)
+                        if data.get("ok") == 1:
+                            logger.info("Cookie刷新验证成功")
+                            return cookies
+                    except:
+                        pass
             return None
         except:
             return None
@@ -798,7 +827,6 @@ class WeiboMonitor(Star):
 
     @filter.command("微博状态")
     async def weibo_status(self, event: AstrMessageEvent):
-        static_cookies = self.config.get("cookies", "").strip()
         auto_cookies = self._cookie_manager.cookies
         watch_users = self._parse_multiline_config("watch_users")
         target_groups = self._parse_multiline_config("target_groups")
@@ -808,7 +836,8 @@ class WeiboMonitor(Star):
 
         # 确定使用的是哪种Cookie
         active_cookie = self._get_active_cookies()
-        cookie_source = "自动获取" if auto_cookies == active_cookie else "手动配置"
+        static_cookie = self.config.get("cookies", "").strip()
+        cookie_source = "手动配置" if static_cookie and static_cookie == active_cookie else "自动获取"
 
         status = [
             "【微博监控状态 v3】",
@@ -919,6 +948,36 @@ class WeiboMonitor(Star):
         yield event.plain_result("🔄 开始检查...")
         asyncio.create_task(self._manual_push())
         yield event.plain_result("✅ 已开始检查")
+
+    @filter.command("微博导入Cookie")
+    async def weibo_import_cookie(self, event: AstrMessageEvent):
+        """手动导入Cookie"""
+        msg = event.message_str.strip()
+        if not msg:
+            yield event.plain_result(
+                "📋 使用方法：\n"
+                "/微博导入Cookie <cookie字符串>\n\n"
+                "💡 如何获取Cookie：\n"
+                "1. 在浏览器登录 weibo.com\n"
+                "2. 按F12打开开发者工具\n"
+                "3. 复制 Application > Cookies 中的全部内容\n"
+                "4. 粘贴到这里"
+            )
+            return
+
+        yield event.plain_result("🔄 正在验证Cookie...")
+
+        if await self._verify_cookies(msg):
+            self._cookie_manager.cookies = msg
+            self._cookie_manager.last_updated = datetime.now().isoformat()
+            self._cookie_manager.expires_at = (datetime.now() + timedelta(days=7)).isoformat()
+            self._save_cookies()
+            yield event.plain_result("✅ Cookie导入成功！")
+        else:
+            yield event.plain_result(
+                "❌ Cookie验证失败\n\n"
+                "请检查Cookie是否正确，确保包含 SUB 参数"
+            )
 
     async def _manual_push(self):
         await self._check_new_posts()
