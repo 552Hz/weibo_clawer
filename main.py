@@ -73,6 +73,7 @@ class WeiboMonitor(Star):
         self._cookie_refresh_task: Optional[asyncio.Task] = None
         self._last_request_time = 0
         self._playwright_browser = None
+        self._pending_qr_login = None  # 二维码登录状态
         logger.info("微博监控插件v3已加载")
 
     def _load_state(self):
@@ -160,70 +161,113 @@ class WeiboMonitor(Star):
 
     async def _auto_login_weibo(self) -> Optional[str]:
         """
-        使用Playwright自动登录微博获取Cookie
+        获取微博登录二维码
         返回Cookie字符串或None
         """
-        browser = await self._init_playwright()
-        if not browser:
-            return None
-
-        page = None
         try:
-            logger.info("开始自动登录微博...")
+            logger.info("开始获取微博登录二维码...")
 
-            # 设置更长的超时
-            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-            page = await browser.new_page(viewport={"width": 1280, "height": 720})
+            session = await self._get_session()
 
-            # 先尝试访问移动端登录（更容易处理）
-            try:
-                await page.goto(
-                    "https://passport.weibo.com/visitor/visitor",
-                    wait_until="domcontentloaded",
-                    timeout=60000
-                )
-                await asyncio.sleep(2)
-            except Exception:
-                # 备用：访问主站
-                await page.goto("https://weibo.com", wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(2)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://weibo.com/",
+            }
 
-            # 等待用户扫码登录
-            logger.info("请在浏览器中扫码登录微博（60秒内）...")
+            # Step 1: 获取二维码ticket
+            async with session.get("https://login.sina.com.cn/sso/qrcode", headers=headers) as resp:
+                if resp.status != 200:
+                    logger.error("获取二维码失败")
+                    return None
 
-            # 等待登录成功标志（检查是否有用户信息）
-            try:
-                await page.wait_for_function(
-                    """() => document.cookie.includes('SUB') || document.cookie.includes('ALF')""",
-                    timeout=60000
-                )
-                cookies = await page.context.cookies()
-                if cookies:
-                    cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
+                data = await resp.json()
+                if data.get("retcode") != 20000000:
+                    logger.error(f"获取二维码失败: {data}")
+                    return None
 
-                    if await self._verify_cookies(cookie_str):
-                        logger.info("自动获取Cookie成功")
-                        return cookie_str
-            except PlaywrightTimeoutError:
-                logger.info("等待登录超时，请手动扫码")
+                qrid = data.get("qrid", "")
 
-            # 获取当前cookies（可能部分有效）
-            cookies = await page.context.cookies()
-            if cookies:
-                cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
-                if await self._verify_cookies(cookie_str):
-                    logger.info("获取到Cookie")
-                    return cookie_str
+                # 二维码图片地址
+                qr_img_url = f"https://login.sina.com.cn/cgi/qrcode.php?action=qrcode&qrt=image&qrid={qrid}"
 
-            logger.info("检测到需要登录，请手动扫码...")
-            return None
+                logger.info("")
+                logger.info("=" * 60)
+                logger.info("【微博扫码登录】")
+                logger.info("=" * 60)
+                logger.info(f"📱 二维码图片: {qr_img_url}")
+                logger.info(f"🔗 也可直接访问: https://weibo.com/login/qrcode")
+                logger.info("")
+                logger.info("请使用微博APP扫码登录")
+                logger.info("扫码后请等待日志确认...")
+                logger.info("=" * 60)
+                logger.info("")
+
+                # 保存登录状态
+                self._pending_qr_login = {
+                    "qrid": qrid,
+                    "start_time": time.time()
+                }
+
+                # Step 2: 轮询检查扫码状态（最多120秒）
+                for i in range(60):
+                    await asyncio.sleep(2)
+
+                    check_url = f"https://login.sina.com.cn/sso/qrcode/{qrid}/conf"
+                    async with session.get(check_url, headers=headers) as check_resp:
+                        if check_resp.status == 200:
+                            result = await check_resp.json()
+                            retcode = result.get("retcode", 0)
+
+                            if retcode == 20000000:
+                                logger.info("⏳ 等待扫码中...")
+                            elif retcode == 21000000:
+                                # 扫码成功，获取cookie
+                                logger.info("✅ 扫码成功！正在获取Cookie...")
+
+                                uid = result.get("uid", "")
+                                ticket = result.get("ticket", "")
+
+                                # 使用ticket换取完整cookie
+                                auth_url = f"https://login.sina.com.cn/sso/qrcode/{qrid}/authorize"
+                                async with session.get(auth_url, headers=headers) as auth_resp:
+                                    if auth_resp.status == 200:
+                                        auth_result = await auth_resp.json()
+                                        if auth_result.get("retcode") == 0:
+                                            cookies = auth_result.get("data", {}).get("cookie", "")
+                                            if cookies:
+                                                self._pending_qr_login = None
+                                                return cookies
+
+                                # 如果authorize失败，尝试用ticket
+                                if ticket:
+                                    try:
+                                        # 访问微博获取完整cookie
+                                        verify_url = "https://weibo.com/sso/login"
+
+                                        async with session.get("https://weibo.com/", headers=headers) as weibo_resp:
+                                            final_cookies = weibo_resp.headers.get("Set-Cookie", "")
+                                            if final_cookies:
+                                                self._pending_qr_login = None
+                                                return final_cookies
+                                    except:
+                                        pass
+
+                                logger.info("获取Cookie失败，请使用手动导入")
+                                return None
+
+                            elif retcode == 21000001:
+                                logger.info("❌ 扫码已取消")
+                                return None
+                            elif retcode == 50060001:
+                                logger.info("❌ 二维码已过期，请重新执行 /微博登录")
+                                return None
+
+                logger.info("⏰ 扫码超时，请重新执行 /微博登录")
+                return None
 
         except Exception as e:
-            logger.error(f"自动登录失败: {e}")
+            logger.error(f"获取二维码失败: {e}")
             return None
-        finally:
-            if page:
-                await page.close()
 
     async def _verify_cookies(self, cookies: str) -> bool:
         """验证Cookie是否有效"""
@@ -808,21 +852,22 @@ class WeiboMonitor(Star):
             "/微博状态 - 查看监控状态\n"
             "/微博测试 - 测试微博连接\n"
             "/微博推送 - 手动触发检查\n"
-            "/微博登录 - 自动登录获取Cookie\n"
+            "/微博登录 - 获取登录二维码\n"
             "/微博刷新Cookie - 刷新Cookie\n"
+            "/微博导入Cookie - 手动导入Cookie\n"
             "/微博监控 - 显示此帮助\n\n"
             "⚙️ 配置项：\n"
-            "• cookies - 微博Cookie（可选，支持自动获取）\n"
+            "• cookies - 微博Cookie（可选）\n"
             "• watch_users - 监控用户UID\n"
             "• target_groups - 推送群聊ID\n"
             "• target_users - 推送私聊用户ID\n"
             "• check_interval - 检查间隔(分钟)\n"
             "• skip_top_post - 是否跳过置顶\n"
             "• include_retweet - 是否包含转发动态\n\n"
-            "🔧 自动Cookie功能：\n"
-            "• 自动获取Cookie无需手动配置\n"
-            "• 每6小时自动刷新Cookie\n"
-            "• 也支持手动配置的静态Cookie"
+            "🔧 Cookie获取方式：\n"
+            "• 执行 /微博登录 获取二维码，用微博APP扫码\n"
+            "• 或使用 /微博导入Cookie 手动导入Cookie\n"
+            "• Cookie每6小时自动刷新"
         )
 
     @filter.command("微博状态")
@@ -896,8 +941,8 @@ class WeiboMonitor(Star):
 
     @filter.command("微博登录")
     async def weibo_login(self, event: AstrMessageEvent):
-        """触发自动登录获取Cookie"""
-        yield event.plain_result("🔄 正在尝试自动登录微博获取Cookie...\n(需要服务器有playwright支持)")
+        """获取微博登录二维码"""
+        yield event.plain_result("🔄 正在获取登录二维码...\n请查看控制台日志中的二维码链接")
 
         try:
             cookies = await self._auto_login_weibo()
@@ -910,12 +955,10 @@ class WeiboMonitor(Star):
                 yield event.plain_result("✅ Cookie获取成功！已自动保存。")
             else:
                 yield event.plain_result(
-                    "❌ 自动登录失败\n\n"
-                    "可能原因：\n"
-                    "1. 服务器未安装playwright: pip install playwright\n"
-                    "2. 未安装浏览器: playwright install chromium\n"
-                    "3. 需要手动配置Cookie\n\n"
-                    "请检查日志获取更多信息。"
+                    "❌ 自动获取失败\n\n"
+                    "请尝试：\n"
+                    "1. 使用 /微博导入Cookie 手动导入\n"
+                    "2. 或在配置文件中设置 cookies"
                 )
         except Exception as e:
             logger.error(f"登录失败: {e}")
