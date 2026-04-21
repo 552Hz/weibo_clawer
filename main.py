@@ -176,8 +176,10 @@ class WeiboMonitor(Star):
 
             # Step 1: 获取二维码ticket
             async with session.get("https://login.sina.com.cn/sso/qrcode", headers=headers) as resp:
+                logger.info(f"二维码接口响应状态: {resp.status}")
                 if resp.status != 200:
-                    logger.error("获取二维码失败")
+                    text = await resp.text() if hasattr(resp, 'text') else "无法获取响应"
+                    logger.error(f"获取二维码失败，状态码: {resp.status}, 响应: {text[:200]}")
                     return None
 
                 data = await resp.json()
@@ -372,6 +374,7 @@ class WeiboMonitor(Star):
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=30, connect=15)
+            # 禁用SSL验证以解决Docker环境中的证书问题
             connector = aiohttp.TCPConnector(ssl=False, limit=10)
             self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         return self.session
