@@ -1,4 +1,4 @@
 # 微博监控插件依赖
 aiohttp>=3.9.0
 Pillow>=10.0.0
-selenium>=4.15.0
+playwright>=1.40.0

@@ -17,12 +17,16 @@ AstrBot 微博监控插件，定时爬取指定微博用户的新动态并推送
 
 1. 下载插件ZIP并解压到 AstrBot 插件目录
 2. 安装依赖：`pip install -r requirements.txt`
-3. 确保服务器已安装 Chrome 浏览器
+3. **安装 Playwright 浏览器**（Docker 环境）：
+   ```bash
+   playwright install chromium
+   ```
 4. 在 AstrBot WebUI 中配置插件参数
 
 ## 依赖要求
 
-- **Chrome 浏览器**：用于 Selenium 自动登录
+- **Playwright Chromium**：用于自动登录
+  - 安装命令：`playwright install chromium`
 - Python 依赖：见 `requirements.txt`
 
 ## 配置说明
@@ -117,5 +121,5 @@ AstrBot 微博监控插件，定时爬取指定微博用户的新动态并推送
 插件支持自动登录微博获取 Cookie，使用命令 `/微博登录` 即可。
 
 **要求：**
-- 服务器已安装 Chrome 浏览器
-- 已安装 selenium：`pip install selenium`
+- 已安装 playwright：`pip install playwright`
+- 已安装浏览器：`playwright install chromium`
