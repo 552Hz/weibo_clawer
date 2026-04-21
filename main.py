@@ -147,7 +147,8 @@ class WeiboMonitor(Star):
                     '--disable-gpu',
                     '--disable-blink-features=AutomationControlled',
                     '--disable-setuid-sandbox',
-                    '--remote-debugging-port=9222',
+                    '--disable-web-security',
+                    '--user-data-dir=/tmp/chrome-data',
                 ]
             )
             logger.info(f"Playwright 浏览器初始化成功 (平台: {platform.system()})")
@@ -171,17 +172,49 @@ class WeiboMonitor(Star):
         page = None
         try:
             logger.info("开始自动登录微博...")
-            page = await browser.new_page()
 
-            await page.goto("https://weibo.com", wait_until="networkidle")
-            await asyncio.sleep(3)
+            # 设置更长的超时
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            page = await browser.new_page(viewport={"width": 1280, "height": 720})
 
+            # 先尝试访问移动端登录（更容易处理）
+            try:
+                await page.goto(
+                    "https://passport.weibo.com/visitor/visitor",
+                    wait_until="domcontentloaded",
+                    timeout=60000
+                )
+                await asyncio.sleep(2)
+            except Exception:
+                # 备用：访问主站
+                await page.goto("https://weibo.com", wait_until="domcontentloaded", timeout=60000)
+                await asyncio.sleep(2)
+
+            # 等待用户扫码登录
+            logger.info("请在浏览器中扫码登录微博（60秒内）...")
+
+            # 等待登录成功标志（检查是否有用户信息）
+            try:
+                await page.wait_for_function(
+                    """() => document.cookie.includes('SUB') || document.cookie.includes('ALF')""",
+                    timeout=60000
+                )
+                cookies = await page.context.cookies()
+                if cookies:
+                    cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
+
+                    if await self._verify_cookies(cookie_str):
+                        logger.info("自动获取Cookie成功")
+                        return cookie_str
+            except PlaywrightTimeoutError:
+                logger.info("等待登录超时，请手动扫码")
+
+            # 获取当前cookies（可能部分有效）
             cookies = await page.context.cookies()
             if cookies:
                 cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
-
                 if await self._verify_cookies(cookie_str):
-                    logger.info("自动获取Cookie成功")
+                    logger.info("获取到Cookie")
                     return cookie_str
 
             logger.info("检测到需要登录，请手动扫码...")
